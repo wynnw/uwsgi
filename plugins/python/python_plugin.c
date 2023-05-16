@@ -1463,41 +1463,40 @@ int uwsgi_check_python_mtime(PyObject *times_dict, char *filename) {
 PyObject *uwsgi_python_setup_thread(char *name) {
 
 	// block signals on this thread
-        sigset_t smask;
-        sigfillset(&smask);
+	sigset_t smask;
+	sigfillset(&smask);
 #ifndef UWSGI_DEBUG
-        sigdelset(&smask, SIGSEGV);
+	sigdelset(&smask, SIGSEGV);
 #endif
-        pthread_sigmask(SIG_BLOCK, &smask, NULL);
+	pthread_sigmask(SIG_BLOCK, &smask, NULL);
 
-        PyThreadState *pts = PyThreadState_New(up.main_thread->interp);
-        pthread_setspecific(up.upt_save_key, (void *) pts);
-        pthread_setspecific(up.upt_gil_key, (void *) pts);
+	PyThreadState *pts = PyThreadState_New(up.main_thread->interp);
+	pthread_setspecific(up.upt_save_key, (void *) pts);
+	pthread_setspecific(up.upt_gil_key, (void *) pts);
 
-        UWSGI_GET_GIL;
+	UWSGI_GET_GIL;
 
-        PyObject *threading_module = PyImport_ImportModule("threading");
-        if (threading_module) {
-                PyObject *threading_module_dict = PyModule_GetDict(threading_module);
-                if (threading_module_dict) {
-                        PyObject *threading_current = PyDict_GetItemString(threading_module_dict, "current_thread");
-                        if (threading_current) {
-                                PyObject *current_thread = PyObject_CallObject(threading_current, (PyObject *)NULL);
-                                if (!current_thread) {
-                                        // ignore the error
-                                        PyErr_Clear();
-                                }
-                                else {
-                                        PyObject_SetAttrString(current_thread, "name", PyString_FromString(name));
-                                        Py_INCREF(current_thread);
+	PyObject *threading_module = PyImport_ImportModule("threading");
+	if (threading_module) {
+		PyObject *threading_module_dict = PyModule_GetDict(threading_module);
+		if (threading_module_dict) {
+			PyObject *threading_current = PyDict_GetItemString(threading_module_dict, "current_thread");
+			if (threading_current) {
+				PyObject *current_thread = PyObject_CallObject(threading_current, (PyObject *)NULL);
+				if (!current_thread) {
+					// ignore the error
+					PyErr_Clear();
+				}
+				else {
+					PyObject_SetAttrString(current_thread, "name", PyString_FromString(name));
+					Py_INCREF(current_thread);
 					return current_thread;
-                                }
-                        }
-                }
+				}
+			}
+		}
+	}
 
-        }
-
-        return NULL;
+	return NULL;
 }
 
 
@@ -1702,7 +1701,7 @@ uint64_t uwsgi_python_rpc(void *func, uint8_t argc, char **argv, uint16_t argvs[
 	PyObject *ret;
 
 	if (!pyargs)
-		return 0;
+		goto cleanup;
 
 	for (i = 0; i < argc; i++) {
 		PyTuple_SetItem(pyargs, i, PyString_FromStringAndSize(argv[i], argvs[i]));
@@ -1728,6 +1727,7 @@ uint64_t uwsgi_python_rpc(void *func, uint8_t argc, char **argv, uint16_t argvs[
 	if (PyErr_Occurred())
 		PyErr_Print();
 
+cleanup:
 	UWSGI_RELEASE_GIL;
 
 	return 0;
