@@ -55,6 +55,141 @@ clear:
 	return NULL;
 }
 
+#ifdef UWSGI_PY311
+
+void *uwsgi_python_tracebacker_thread(void *foobar) {
+	struct iovec iov[1];
+	struct sockaddr_un so_sun;
+	socklen_t so_sun_len = 0;
+	PyObject *uwsgi_tracebacker_module = NULL, *uwsgi_tracebacker_code = NULL;
+
+	// locks the GIL
+	PyObject *new_thread = uwsgi_python_setup_thread("uWSGITraceBacker");
+	if (!new_thread) return NULL;
+
+	char *str_wid = uwsgi_num2str(uwsgi.mywid);
+	char *sock_path = uwsgi_concat2(up.tracebacker, str_wid);
+	free(str_wid);
+
+	int current_defer_accept = uwsgi.no_defer_accept;
+	uwsgi.no_defer_accept = 1;
+	int fd = bind_to_unix(sock_path, uwsgi.listen_queue, uwsgi.chmod_socket, uwsgi.abstract_socket);
+	uwsgi.no_defer_accept = current_defer_accept;
+	if (fd < 0) {
+		goto cleanup;
+	}
+
+	char *uwsgi_tracebacker_codestr =
+		"import sys, threading, traceback\n"
+		"\n"
+		"def uwsgi_tracebacker_lines():\n"
+		"    rval = []\n"
+		"    frames = sys._current_frames()\n"
+		"    for tid, f in frames.items():\n"
+		"        threadname = threading._active.get(tid).name\n"
+		"        if threadname.startswith('uWSGIWorker'):\n"
+		"            ss = traceback.extract_stack(f)\n"
+		"            rval.extend(ss.format())\n"
+		"    return rval\n";
+	uwsgi_tracebacker_code = Py_CompileString(uwsgi_tracebacker_codestr, "uwsgi_tracebacker", Py_file_input);
+	if (uwsgi_tracebacker_code) {
+		uwsgi_tracebacker_module = PyImport_ExecCodeModule("uwsgi_tracebacker", uwsgi_tracebacker_code);
+		if (!uwsgi_tracebacker_module) {
+			uwsgi_log("!!! Failed to create tracebacker module\n");
+			PyErr_Print();
+		}
+	} else {
+		if (PyErr_Occurred()) {
+			uwsgi_log("!!! failed to compile tracebacker string, error:\n");
+			PyErr_Print();
+		} else {
+			uwsgi_log("!!! failed to compile tracebacker string, unknown error\n");
+		}
+	}
+	UWSGI_RELEASE_GIL;
+
+	if (!uwsgi_tracebacker_code || !uwsgi_tracebacker_module) {
+		goto cleanup;
+	}
+
+	uwsgi_log("** python3.11 tracebacker for worker %d available on %s\n", uwsgi.mywid, sock_path);
+
+	while (uwsgi.shutdown_sockets == 0) {
+		int client_fd = accept(fd, (struct sockaddr *) &so_sun, &so_sun_len);
+		if (client_fd < 0) {
+			uwsgi_error("accept()");
+			goto loopcontinue;
+		}
+		UWSGI_GET_GIL;
+
+		PyObject *lines_iter = NULL, *line = NULL;
+		PyObject *lines = PyObject_CallMethod(uwsgi_tracebacker_module, "uwsgi_tracebacker_lines", NULL);
+		if (!lines) {
+			uwsgi_log("pytracebacker: uwsgi_tracebacker_lines");
+			PyErr_Print();
+			goto loopcleanup;
+		}
+
+		lines_iter = PyObject_GetIter(lines);
+		if (!lines_iter) {
+			uwsgi_log("pytracebacker: lines iterator");
+			PyErr_Print();
+			goto loopcleanup;
+		}
+
+		char *header = "*** uWSGI Python tracebacker output ***\n";
+		int header_len = strlen(header);
+		line = PyIter_Next(lines_iter);
+		if (line != NULL) {
+			if (write(client_fd, header, header_len) < 0) {
+				uwsgi_error("write()");
+			}
+		}
+		
+		while(line) {
+			PyObject *line_bytes = PyUnicode_AsEncodedString(line, "utf8", NULL);
+			char* line_bytes_cstr = PyBytes_AS_STRING(line_bytes);
+			if (line_bytes_cstr) {
+				iov[0].iov_base = line_bytes_cstr;
+				iov[0].iov_len = PyBytes_GET_SIZE(line_bytes);
+				if (writev(client_fd, iov, 1) < 0) {
+					uwsgi_error("writev()");
+				}
+			}
+
+			if (line_bytes) Py_DECREF(line_bytes);
+			Py_DECREF(line);
+			line = PyIter_Next(lines_iter);
+		}
+
+		loopcleanup:
+		if (lines_iter) Py_DECREF(lines_iter);
+		if (lines) Py_DECREF(lines);
+
+		UWSGI_RELEASE_GIL;
+	
+		loopcontinue:
+		if (client_fd >= 0) {
+			close(client_fd);
+		}
+	}
+
+cleanup:
+    if (uwsgi_tracebacker_module != NULL || uwsgi_tracebacker_code != NULL) {
+        UWSGI_GET_GIL;
+        if (uwsgi_tracebacker_module) Py_DECREF(uwsgi_tracebacker_module);
+        if (uwsgi_tracebacker_code) Py_DECREF(uwsgi_tracebacker_code);
+        UWSGI_RELEASE_GIL;
+    }
+	if (sock_path) free(sock_path);
+	if (fd >= 0) close(fd);
+
+	return NULL;
+}
+
+#else
+
+// old pre 3.11 version
 void *uwsgi_python_tracebacker_thread(void *foobar) {
 
 	struct iovec iov[11];
@@ -288,3 +423,5 @@ end2:
 	}
 	return NULL;
 }
+
+#endif
