@@ -58,14 +58,19 @@ clear:
 #ifdef UWSGI_PY311
 
 void *uwsgi_python_tracebacker_thread(void *foobar) {
-	struct iovec iov[1];
+	struct iovec iov;
 	struct sockaddr_un so_sun;
 	socklen_t so_sun_len = 0;
-	PyObject *uwsgi_tracebacker_module = NULL, *uwsgi_tracebacker_code = NULL;
+	PyObject *new_thread = NULL, *globalsDict = NULL, *localsDict = NULL, *codeFunc = NULL;
+	
+	memset(&iov, 0, sizeof(iov));
 
-	// locks the GIL
-	PyObject *new_thread = uwsgi_python_setup_thread("uWSGITraceBacker");
-	if (!new_thread) return NULL;
+	// this function locks the GIL
+	new_thread = uwsgi_python_setup_thread("uWSGITraceBacker");
+	if (!new_thread) {
+		UWSGI_RELEASE_GIL;
+		return NULL;
+	}
 
 	char *str_wid = uwsgi_num2str(uwsgi.mywid);
 	char *sock_path = uwsgi_concat2(up.tracebacker, str_wid);
@@ -78,41 +83,38 @@ void *uwsgi_python_tracebacker_thread(void *foobar) {
 	if (fd < 0) {
 		goto cleanup;
 	}
-
-	char *uwsgi_tracebacker_codestr =
-		"import sys, threading, traceback\n"
+	
+	char *codestr =
+		"def uwsgi_tracebacker_process_frame(frame):\n"
+		"    import io, traceback\n"
 		"\n"
-		"def uwsgi_tracebacker_lines():\n"
-		"    rval = []\n"
-		"    frames = sys._current_frames()\n"
-		"    for tid, f in frames.items():\n"
-		"        threadname = threading._active.get(tid).name\n"
-		"        if threadname.startswith('uWSGIWorker'):\n"
-		"            ss = traceback.extract_stack(f)\n"
-		"            rval.extend(ss.format())\n"
-		"    return rval\n";
-	uwsgi_tracebacker_code = Py_CompileString(uwsgi_tracebacker_codestr, "uwsgi_tracebacker", Py_file_input);
-	if (uwsgi_tracebacker_code) {
-		uwsgi_tracebacker_module = PyImport_ExecCodeModule("uwsgi_tracebacker", uwsgi_tracebacker_code);
-		if (!uwsgi_tracebacker_module) {
-			uwsgi_log("!!! Failed to create tracebacker module\n");
-			PyErr_Print();
-		}
+		"    lines = 0\n"
+		"    rval = io.StringIO()\n"
+		"    rval.write('*** uWSGI Python tracebacker output ***\\n')\n"
+		"    ss = traceback.extract_stack(frame)\n"
+		"    sslines = ss.format()\n"
+		"    if sslines:\n"
+		"        rval.writelines(sslines)\n"
+		"        lines += 1\n"
+		"    return rval.getvalue() if lines > 0 else None\n";
+	globalsDict = PyDict_New();
+	localsDict = PyDict_New();
+	PyObject *result = PyRun_String(codestr, Py_file_input, globalsDict, localsDict);
+	if (!result) {
+		uwsgi_log("!!! Failed to define uwsgi_tracebacker_lines function\n");
+		PyErr_Print();
 	} else {
-		if (PyErr_Occurred()) {
-			uwsgi_log("!!! failed to compile tracebacker string, error:\n");
-			PyErr_Print();
-		} else {
-			uwsgi_log("!!! failed to compile tracebacker string, unknown error\n");
-		}
+		codeFunc = PyDict_GetItemString(localsDict, "uwsgi_tracebacker_process_frame");
+		Py_DECREF(result);
 	}
 	UWSGI_RELEASE_GIL;
 
-	if (!uwsgi_tracebacker_code || !uwsgi_tracebacker_module) {
+	if (!codeFunc) {
+		uwsgi_log("** failed to initialize python tracebacker thread for worker %d'n", uwsgi.mywid);
 		goto cleanup;
 	}
 
-	uwsgi_log("** python3.11 tracebacker for worker %d available on %s\n", uwsgi.mywid, sock_path);
+	uwsgi_log("** python3.11 tracebacker for worker %d listening on %s\n", uwsgi.mywid, sock_path);
 
 	while (uwsgi.shutdown_sockets == 0) {
 		int client_fd = accept(fd, (struct sockaddr *) &so_sun, &so_sun_len);
@@ -120,51 +122,40 @@ void *uwsgi_python_tracebacker_thread(void *foobar) {
 			uwsgi_error("accept()");
 			goto loopcontinue;
 		}
+
 		UWSGI_GET_GIL;
 
-		PyObject *lines_iter = NULL, *line = NULL;
-		PyObject *lines = PyObject_CallMethod(uwsgi_tracebacker_module, "uwsgi_tracebacker_lines", NULL);
-		if (!lines) {
-			uwsgi_log("pytracebacker: uwsgi_tracebacker_lines");
-			PyErr_Print();
-			goto loopcleanup;
-		}
-
-		lines_iter = PyObject_GetIter(lines);
-		if (!lines_iter) {
-			uwsgi_log("pytracebacker: lines iterator");
-			PyErr_Print();
-			goto loopcleanup;
-		}
-
-		char *header = "*** uWSGI Python tracebacker output ***\n";
-		int header_len = strlen(header);
-		line = PyIter_Next(lines_iter);
-		if (line != NULL) {
-			if (write(client_fd, header, header_len) < 0) {
-				uwsgi_error("write()");
-			}
-		}
-		
-		while(line) {
-			PyObject *line_bytes = PyUnicode_AsEncodedString(line, "utf8", NULL);
-			char* line_bytes_cstr = PyBytes_AS_STRING(line_bytes);
-			if (line_bytes_cstr) {
-				iov[0].iov_base = line_bytes_cstr;
-				iov[0].iov_len = PyBytes_GET_SIZE(line_bytes);
-				if (writev(client_fd, iov, 1) < 0) {
-					uwsgi_error("writev()");
+		PyFrameObject *threadFrame = PyThreadState_GetFrame(up.main_thread);
+		if (threadFrame) {
+			PyObject *tb = PyObject_CallFunctionObjArgs(codeFunc, threadFrame, NULL);
+			if (!tb) {
+				uwsgi_log("pytracebacker(%d): uwsgi_tracebacker failed\n", uwsgi.mywid);
+				PyErr_Print();
+			} else {
+				if (tb != Py_None) {
+					PyObject *tb_bytes = PyUnicode_AsUTF8String(tb);
+					if (tb_bytes) {
+						char* tb_bytes_cstr = PyBytes_AS_STRING(tb_bytes);  // internal ptr, don't free
+						int tb_bytes_len = PyBytes_GET_SIZE(tb_bytes);
+						if (tb_bytes_cstr) {
+							iov.iov_base = tb_bytes_cstr;
+							iov.iov_len = tb_bytes_len;
+							int bytes_written = writev(client_fd, &iov, 1);
+							if (bytes_written < 0) {
+								uwsgi_error("writev()");
+							} else if (bytes_written < tb_bytes_len) {
+								uwsgi_log("pytracebacker(%d): only wrote %d/%d bytes\n", uwsgi.mywid, bytes_written, tb_bytes_len);
+							} else {
+								uwsgi_log("**!! pytracebacker(%d): sent traceback\n", uwsgi.mywid);
+							}
+						}
+						Py_DECREF(tb_bytes);
+					}
 				}
+				Py_DECREF(tb);
 			}
-
-			if (line_bytes) Py_DECREF(line_bytes);
-			Py_DECREF(line);
-			line = PyIter_Next(lines_iter);
+			Py_DECREF(threadFrame);
 		}
-
-		loopcleanup:
-		if (lines_iter) Py_DECREF(lines_iter);
-		if (lines) Py_DECREF(lines);
 
 		UWSGI_RELEASE_GIL;
 	
@@ -175,12 +166,13 @@ void *uwsgi_python_tracebacker_thread(void *foobar) {
 	}
 
 cleanup:
-    if (uwsgi_tracebacker_module != NULL || uwsgi_tracebacker_code != NULL) {
-        UWSGI_GET_GIL;
-        if (uwsgi_tracebacker_module) Py_DECREF(uwsgi_tracebacker_module);
-        if (uwsgi_tracebacker_code) Py_DECREF(uwsgi_tracebacker_code);
-        UWSGI_RELEASE_GIL;
-    }
+	UWSGI_GET_GIL;
+	Py_XDECREF(codeFunc);
+	Py_XDECREF(globalsDict);
+	Py_XDECREF(localsDict);
+	Py_DECREF(new_thread);
+	UWSGI_RELEASE_GIL;
+
 	if (sock_path) free(sock_path);
 	if (fd >= 0) close(fd);
 
